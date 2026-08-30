@@ -10,6 +10,18 @@ it owns.
 Part of the [RustArchon](https://github.com/RustArchon/RustArchon) system - see that repo for the
 full architecture and how to run the whole stack locally or via Docker Compose.
 
+## Key files
+
+- `RustWebRconClient.cs` - the client itself: connect, send commands, dispatch received frames to
+  the right parser and event.
+- `Parsers/` - one parser per response shape (`ChatParser`, `ConsoleParser`, `PlayerParser`,
+  `BanParser`, `{Oxide,Carbon}PluginListParser`, `{Oxide,Carbon}VersionParser` - detecting which mod
+  framework a server runs, if any).
+- `Entities/` - the parsed domain types (`ChatMessage`, `ConsoleMessage`, `Player`, `Ban`,
+  `ServerInfo`, plugin types).
+- `EventArgs/` - one event per entity type, raised as `RustWebRconClient` receives and parses frames.
+- `Messages/WebRcon{Request,Response}.cs` - the raw WebRCON protocol frame shapes, before parsing.
+
 ## License
 
 AGPL-3.0-or-later - see [`LICENSE`](LICENSE). See [`NOTICE.md`](NOTICE.md) for how this project
