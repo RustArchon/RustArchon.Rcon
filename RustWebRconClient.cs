@@ -100,6 +100,12 @@ public class RustWebRconClient : IDisposable
 
     private readonly object _pendingCommandsLock = new();
     private readonly Dictionary<int, TaskCompletionSource<WebRconResponse>> _pendingCommands = new();
+
+    // Identifiers sent via SendCommandAsync(..., raiseMessageReceived: false) - see that parameter's
+    // remarks. Populated before the request goes out (so there's no window where the response could
+    // race ahead of this registration) and consumed exactly once, in OnMessageReceived.
+    private readonly object _quietRequestsLock = new();
+    private readonly HashSet<int> _quietRequests = new();
     #endregion
 
     #region Constructor
@@ -168,12 +174,20 @@ public class RustWebRconClient : IDisposable
 
     private void Socket_OnClose(DisconnectionInfo disconnectionInfo)
     {
-        OnConnectionChanged(false);
+        var detail = disconnectionInfo.CloseStatus.HasValue
+            ? $"{disconnectionInfo.Type} ({disconnectionInfo.CloseStatus})"
+            : disconnectionInfo.Type.ToString();
+        if (!string.IsNullOrEmpty(disconnectionInfo.CloseStatusDescription))
+        {
+            detail += $": {disconnectionInfo.CloseStatusDescription}";
+        }
+
+        OnConnectionChanged(false, detail, disconnectionInfo.Exception);
     }
 
     private void Socket_OnOpen(ReconnectionInfo reconnectionInfo)
     {
-        OnConnectionChanged(true);
+        OnConnectionChanged(true, reconnectionInfo.Type.ToString());
 
         // Determine the mod framework as soon as possible after connecting, rather than waiting for
         // a caller to ask - once known, this is a no-op (a reconnect doesn't change what's installed).
@@ -199,7 +213,12 @@ public class RustWebRconClient : IDisposable
             // directly rather than also running it through parser dispatch/the Unknown fallback below,
             // which would be redundant noise for a caller that's already getting the raw response.
             pendingCommand.TrySetResult(response);
-            MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled: true));
+
+            if (!WasSentQuietly(response.Identifier))
+            {
+                MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled: true));
+            }
+
             return;
         }
 
@@ -254,12 +273,32 @@ public class RustWebRconClient : IDisposable
             OnUnknownMessageReceived(response);
         }
 
-        MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled));
+        // A genuinely unsolicited frame's identifier was never ours to register as quiet in the first
+        // place, so this only ever actually suppresses something for a request this client itself
+        // sent with raiseMessageReceived: false - see SendCommand's remarks.
+        if (!WasSentQuietly(response.Identifier))
+        {
+            MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled));
+        }
     }
 
-    private void OnConnectionChanged(bool connected)
+    /// <summary>
+    /// Checks whether <paramref name="identifier"/> was registered as a quiet request (see
+    /// <see cref="SendCommandAsync"/>'s and <see cref="SendCommand"/>'s <c>raiseMessageReceived</c>
+    /// remarks), consuming the registration if so - each identifier is only ever checked once, right
+    /// when its response arrives.
+    /// </summary>
+    private bool WasSentQuietly(int identifier)
     {
-        ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connected));
+        lock (_quietRequestsLock)
+        {
+            return _quietRequests.Remove(identifier);
+        }
+    }
+
+    private void OnConnectionChanged(bool connected, string? detail = null, Exception? exception = null)
+    {
+        ConnectionChanged?.Invoke(this, new ConnectionChangedEventArgs(connected, detail, exception));
     }
     #endregion
 
@@ -406,9 +445,18 @@ public class RustWebRconClient : IDisposable
     /// <c>Identifier</c> sequence - the general-purpose counterpart to the typed <c>GetXxx</c> methods,
     /// for commands with no dedicated parser (or callers that just want the raw text back).
     /// </summary>
+    /// <param name="raiseMessageReceived">
+    /// Whether this response should also be broadcast via <see cref="MessageReceived"/> once the
+    /// caller has it. Defaults to <c>true</c>, matching every other way of receiving a response. Pass
+    /// <c>false</c> for a request the caller wants privately, without it also reaching whatever else
+    /// is observing the general raw stream - e.g. a caller polling a status command on its own
+    /// schedule for internal bookkeeping, where that response isn't part of the server's own
+    /// console/chat history.
+    /// </param>
     /// <exception cref="InvalidOperationException">The socket isn't currently connected.</exception>
     /// <exception cref="TimeoutException"><paramref name="timeout"/> elapsed with no response.</exception>
-    public async Task<WebRconResponse> SendCommandAsync(string command, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
+    public async Task<WebRconResponse> SendCommandAsync(
+        string command, TimeSpan? timeout = null, CancellationToken cancellationToken = default, bool raiseMessageReceived = true)
     {
         var request = new WebRconRequest { Message = command, Identifier = _sequence.GetValue() };
         var completionSource = new TaskCompletionSource<WebRconResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -416,6 +464,17 @@ public class RustWebRconClient : IDisposable
         lock (_pendingCommandsLock)
         {
             _pendingCommands[request.Identifier] = completionSource;
+        }
+
+        if (!raiseMessageReceived)
+        {
+            // Registered before SendRequest goes out, not after awaiting it - the response can arrive
+            // (and OnMessageReceived can run) before this method's own call to SendRequest even
+            // returns, so there is no safe point after sending to register this.
+            lock (_quietRequestsLock)
+            {
+                _quietRequests.Add(request.Identifier);
+            }
         }
 
         try
@@ -435,18 +494,42 @@ public class RustWebRconClient : IDisposable
             {
                 _pendingCommands.Remove(request.Identifier);
             }
+
+            // Normally already consumed by OnMessageReceived once the response arrives - this only
+            // does anything if it never got that far (the send itself failed, or the wait above timed
+            // out/was cancelled first), so a quiet request's flag doesn't linger forever.
+            if (!raiseMessageReceived)
+            {
+                lock (_quietRequestsLock)
+                {
+                    _quietRequests.Remove(request.Identifier);
+                }
+            }
         }
     }
     #endregion
 
     #region Private Methods
-    private void SendCommand(string command, ParserBase parser)
+    /// <param name="raiseMessageReceived">See <see cref="SendCommandAsync"/>'s remarks on the same
+    /// parameter - same meaning, just for this fire-and-forget/parser-dispatch path instead.</param>
+    private void SendCommand(string command, ParserBase parser, bool raiseMessageReceived = true)
     {
         var request = new WebRconRequest { Message = command, Identifier = _sequence.GetValue() };
         lock (_outstandingRequestsLock)
         {
             _outstandingRequests.Add(request.Identifier, parser);
         }
+
+        if (!raiseMessageReceived)
+        {
+            // Same reasoning as SendCommandAsync's own quiet registration - done before SendRequest,
+            // not after, since the response can arrive before this call even returns.
+            lock (_quietRequestsLock)
+            {
+                _quietRequests.Add(request.Identifier);
+            }
+        }
+
         SendRequest(request);
     }
 
@@ -471,9 +554,16 @@ public class RustWebRconClient : IDisposable
         }
 
         // Sent outside the lock - SendRequest/SendCommand take their own locks, and there's no need
-        // to hold this one while a message goes out over the socket.
-        SendCommand("o.version", _parsers.First(p => p is OxideVersionParser));
-        SendCommand("c.version", _parsers.First(p => p is CarbonVersionParser));
+        // to hold this one while a message goes out over the socket. Quiet regardless of which of the
+        // three call sites triggered this (automatic post-connect, GetModFrameworkVersion, or
+        // DetectModFrameworkAsync) - every caller already gets the answer through the typed
+        // ModFrameworkVersionReceived/ModFrameworkDetected surface, so none of them need the raw
+        // version-string frame to also show up wherever the general MessageReceived stream ends up
+        // (e.g. RustArchon's own server console tail) - confirmed live: every reconnect was showing a
+        // Carbon/Oxide version banner in the console purely as a side effect of this auto-detection,
+        // not anything the server itself broadcast unprompted.
+        SendCommand("o.version", _parsers.First(p => p is OxideVersionParser), raiseMessageReceived: false);
+        SendCommand("c.version", _parsers.First(p => p is CarbonVersionParser), raiseMessageReceived: false);
 
         return _modFrameworkDetection;
     }
