@@ -47,6 +47,21 @@ public class RustWebRconClient : IDisposable
     /// <summary>Fires exactly once per connection, as soon as the mod framework is determined - see
     /// <see cref="DetectModFrameworkAsync"/>.</summary>
     public event EventHandler<ModFrameworkDetectedEventArgs>? ModFrameworkDetected;
+
+    /// <summary>
+    /// Fires when processing an inbound frame or a connection-state transition throws - from this
+    /// class's own code (e.g. malformed JSON from the server) or from a subscriber to
+    /// <see cref="MessageReceived"/>/<see cref="ConnectionChanged"/>/one of the typed events. See the
+    /// three <c>Socket_On*</c> handlers' remarks for why this exists: Websocket.Client invokes its
+    /// <c>MessageReceived</c>/<c>DisconnectionHappened</c>/<c>ReconnectionHappened</c> subjects
+    /// synchronously from its own receive loop with no try/catch of its own, so an exception raised
+    /// anywhere in this call chain - including inside a subscriber's handler - would otherwise
+    /// propagate back into that loop, which treats it as a fatal connection error and force-reconnects.
+    /// Confirmed live: this is exactly what was turning one bad frame into an endless reconnect loop,
+    /// with the resulting abrupt socket teardown surfacing as unrelated-looking transport exceptions
+    /// (<c>SocketException</c> 10053/10054, etc.) that looked like a network problem but weren't one.
+    /// </summary>
+    public event EventHandler<Exception>? ProcessingError;
     #endregion
 
     #region Public Properties
@@ -150,15 +165,39 @@ public class RustWebRconClient : IDisposable
             _socket.ErrorReconnectTimeout = errorReconnectTimeout;
         }
 
-        _socket.MessageReceived.Subscribe(message => Socket_OnMessage(message));
-        _socket.DisconnectionHappened.Subscribe(info => Socket_OnClose(info));
-        _socket.ReconnectionHappened.Subscribe(info => Socket_OnOpen(info));
+        // Wrapped in SafeExecute, not called directly - see ProcessingError's remarks. This is the
+        // one boundary between our code (including every subscriber's handler, invoked synchronously
+        // from inside these) and Websocket.Client's own receive loop, so it's the one place that
+        // matters for stopping an exception from ever reaching back into the library.
+        _socket.MessageReceived.Subscribe(message => SafeExecute(() => Socket_OnMessage(message)));
+        _socket.DisconnectionHappened.Subscribe(info => SafeExecute(() => Socket_OnClose(info)));
+        _socket.ReconnectionHappened.Subscribe(info => SafeExecute(() => Socket_OnOpen(info)));
 
         InitializeParsers();
     }
     #endregion
 
     #region Socket Events
+    /// <summary>
+    /// Runs <paramref name="action"/>, reporting (via <see cref="ProcessingError"/>) rather than
+    /// propagating any exception it throws. See that event's remarks for why this exists - every
+    /// <c>Socket_On*</c> handler below runs on Websocket.Client's own receive loop and synchronously
+    /// invokes whatever subscribers are attached to this client's events, so this is the only place
+    /// that can catch a bug in either this class's own frame handling or a subscriber's, before it
+    /// reaches back into the library and gets misread as a dead connection.
+    /// </summary>
+    private void SafeExecute(Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception ex)
+        {
+            ProcessingError?.Invoke(this, ex);
+        }
+    }
+
     private void Socket_OnMessage(ResponseMessage message)
     {
         if (message.MessageType == WebSocketMessageType.Text)
