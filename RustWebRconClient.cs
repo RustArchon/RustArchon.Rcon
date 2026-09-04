@@ -220,6 +220,29 @@ public class RustWebRconClient : IDisposable
         {
             detail += $": {disconnectionInfo.CloseStatusDescription}";
         }
+        else if (disconnectionInfo.Exception is { } exception)
+        {
+            // CloseStatusDescription only ever comes from a graceful WebSocket-level close - a lower-
+            // level transport failure (TCP reset, TLS handshake failure, DNS failure, the handshake
+            // getting rejected before it completes, ...) leaves it empty, with the actual reason
+            // sitting in Exception instead. That exception previously never left this process at all -
+            // ConnectionChangedEventArgs carried it all the way to ServerConnectionActor, but only ever
+            // for a local LogWarning call, never folded into the Detail string that actually reaches
+            // ConnectionStatusChanged and, from there, the Panel's connection log - confirmed live: a
+            // real "TCP connects, WebSocket handshake gets forcibly closed" failure showed up there as
+            // a bare "Error", indistinguishable from any other unexplained drop. Walking to the
+            // innermost exception surfaces the actually-useful message - the outer WebSocketException's
+            // own message is just "Unable to connect to the remote server" (unhelpful), while the
+            // SocketException several layers down says the real thing: "An existing connection was
+            // forcibly closed by the remote host".
+            var innermost = exception;
+            while (innermost.InnerException is { } inner)
+            {
+                innermost = inner;
+            }
+
+            detail += $": {innermost.Message}";
+        }
 
         OnConnectionChanged(false, detail, disconnectionInfo.Exception);
     }
@@ -367,16 +390,23 @@ public class RustWebRconClient : IDisposable
     #endregion
 
     #region Public Connection Methods
-    public bool Connect()
+    /// <param name="exception">
+    /// The exception <see cref="_socket"/>.Start() threw, if this returns <c>false</c> - previously
+    /// swallowed entirely with no way for a caller to report it. <c>null</c> when this returns
+    /// <c>true</c>.
+    /// </param>
+    public bool Connect(out Exception? exception)
     {
         try
         {
             _socket.Start();
         }
-        catch
+        catch (Exception ex)
         {
+            exception = ex;
             return false;
         }
+        exception = null;
         return true;
     }
 
