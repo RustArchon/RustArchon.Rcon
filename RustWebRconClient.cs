@@ -154,7 +154,7 @@ public class RustWebRconClient : IDisposable
         Password = password;
         _maxMessageLogSize = maxMessageLogSize;
 
-        var uri = new Uri($"ws://{hostname}:{port}/{password}");
+        var uri = BuildUri(hostname, port, password);
         _socket = new WebsocketClient(uri);
         if (reconnectTimeout.HasValue)
         {
@@ -175,6 +175,27 @@ public class RustWebRconClient : IDisposable
 
         InitializeParsers();
     }
+
+    /// <summary>
+    /// Builds the WebRCON connection URI. Rust authenticates WebRCON via this URL's path segment, not
+    /// a message-based handshake - <c>Uri.EscapeDataString</c> the password here, or any character
+    /// with URI significance (<c>#</c>, <c>?</c>, <c>/</c>, a <c>%</c>-hex-looking sequence, ...)
+    /// silently truncates or splits it before it ever reaches the wire.
+    /// </summary>
+    /// <remarks>
+    /// Confirmed live as the actual cause of a real "can't hold a stable connection" incident: a
+    /// correctly-configured password containing one of those characters made every single connection
+    /// attempt fail Rust's auth check, and because Rust never completes the WebSocket upgrade for a
+    /// failed auth attempt, there's no graceful WS close code to see either (see <see cref="Socket_OnClose"/>'s
+    /// remarks) - it just resets the TCP connection, which surfaces here as "the remote host forcibly
+    /// closed the connection", indistinguishable at a glance from the server actually being down. A
+    /// different, correctly-encoding third-party RCON client held a connection to the same server with
+    /// the same real password the entire time this was broken - unescaped interpolation straight into
+    /// <c>new Uri(...)</c> was the whole difference. Public (not <c>private</c>/<c>internal</c>) so it's
+    /// directly unit-testable without needing a real socket - see RustArchon.Worker.Tests.
+    /// </remarks>
+    public static Uri BuildUri(string hostname, int port, string password) =>
+        new($"ws://{hostname}:{port}/{Uri.EscapeDataString(password)}");
     #endregion
 
     #region Socket Events
