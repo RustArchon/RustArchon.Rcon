@@ -116,11 +116,14 @@ public class RustWebRconClient : IDisposable
     private readonly object _pendingCommandsLock = new();
     private readonly Dictionary<int, TaskCompletionSource<WebRconResponse>> _pendingCommands = new();
 
-    // Identifiers sent via SendCommandAsync(..., raiseMessageReceived: false) - see that parameter's
-    // remarks. Populated before the request goes out (so there's no window where the response could
-    // race ahead of this registration) and consumed exactly once, in OnMessageReceived.
-    private readonly object _quietRequestsLock = new();
-    private readonly HashSet<int> _quietRequests = new();
+    // Whatever userData a caller attached to a request via SendCommandAsync/SendCommand - see
+    // RconCommandContext's remarks for why this exists. Populated before the request goes out (so
+    // there's no window where the response could race ahead of this registration) and consumed exactly
+    // once, in OnMessageReceived - a Dictionary rather than the old HashSet<int>-of-quiet-identifiers it
+    // replaces, since this client no longer decides quiet-or-not itself; it just carries whatever value
+    // (including null) a caller attached, back out on MessageReceivedEventArgs.UserData.
+    private readonly object _userDataLock = new();
+    private readonly Dictionary<int, object?> _userData = new();
 
     // Backoff state for reconnect-after-error delays - see Socket_OnClose/Socket_OnOpen. Websocket.Client
     // itself implements no backoff (a fixed ErrorReconnectTimeout retried indefinitely - confirmed by
@@ -340,10 +343,8 @@ public class RustWebRconClient : IDisposable
             // which would be redundant noise for a caller that's already getting the raw response.
             pendingCommand.TrySetResult(response);
 
-            if (!WasSentQuietly(response.Identifier))
-            {
-                MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled: true));
-            }
+            MessageReceived?.Invoke(
+                this, new MessageReceivedEventArgs(response, handled: true, ConsumeUserData(response.Identifier)));
 
             return;
         }
@@ -399,26 +400,33 @@ public class RustWebRconClient : IDisposable
             OnUnknownMessageReceived(response);
         }
 
-        // A genuinely unsolicited frame's identifier was never ours to register as quiet in the first
-        // place, so this only ever actually suppresses something for a request this client itself
-        // sent with raiseMessageReceived: false - see SendCommand's remarks.
-        if (!WasSentQuietly(response.Identifier))
-        {
-            MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled));
-        }
+        // This client makes no suppress/show decision of its own any more - MessageReceived always
+        // fires. A genuinely unsolicited frame's identifier was never registered in the first place, so
+        // ConsumeUserData just returns null for it, same as a request that was sent with no userData -
+        // both cases are indistinguishable here by design (see RconCommandContext's remarks: it's
+        // RustArchon.Worker's job to interpret UserData, not this client's).
+        MessageReceived?.Invoke(this, new MessageReceivedEventArgs(response, handled, ConsumeUserData(response.Identifier)));
     }
 
     /// <summary>
-    /// Checks whether <paramref name="identifier"/> was registered as a quiet request (see
-    /// <see cref="SendCommandAsync"/>'s and <see cref="SendCommand"/>'s <c>raiseMessageReceived</c>
-    /// remarks), consuming the registration if so - each identifier is only ever checked once, right
-    /// when its response arrives.
+    /// Looks up whatever <c>userData</c> was attached to <paramref name="identifier"/>'s request (see
+    /// <see cref="SendCommandAsync"/>'s and <see cref="SendCommand"/>'s <c>userData</c> parameter),
+    /// consuming the registration if found - each identifier is only ever looked up once, right when
+    /// its response arrives. Returns <c>null</c> for a genuinely unsolicited frame (never registered at
+    /// all) exactly the same as for a request that was sent with <c>userData: null</c> - see
+    /// <see cref="MessageReceivedEventArgs.UserData"/>'s remarks on why that's fine.
     /// </summary>
-    private bool WasSentQuietly(int identifier)
+    private object? ConsumeUserData(int identifier)
     {
-        lock (_quietRequestsLock)
+        lock (_userDataLock)
         {
-            return _quietRequests.Remove(identifier);
+            if (_userData.TryGetValue(identifier, out var value))
+            {
+                _userData.Remove(identifier);
+                return value;
+            }
+
+            return null;
         }
     }
 
@@ -578,18 +586,19 @@ public class RustWebRconClient : IDisposable
     /// <c>Identifier</c> sequence - the general-purpose counterpart to the typed <c>GetXxx</c> methods,
     /// for commands with no dedicated parser (or callers that just want the raw text back).
     /// </summary>
-    /// <param name="raiseMessageReceived">
-    /// Whether this response should also be broadcast via <see cref="MessageReceived"/> once the
-    /// caller has it. Defaults to <c>true</c>, matching every other way of receiving a response. Pass
-    /// <c>false</c> for a request the caller wants privately, without it also reaching whatever else
-    /// is observing the general raw stream - e.g. a caller polling a status command on its own
-    /// schedule for internal bookkeeping, where that response isn't part of the server's own
-    /// console/chat history.
+    /// <param name="userData">
+    /// Carried through unchanged to <see cref="MessageReceivedEventArgs.UserData"/> on the
+    /// <see cref="MessageReceived"/> broadcast for this response - this client attaches no meaning to
+    /// the value itself, it just correlates it back by this request's own <c>Identifier</c>. See
+    /// <see cref="RconCommandContext"/> for how <c>RustArchon.Worker</c> uses this - e.g. a caller
+    /// polling a status command on its own schedule for internal bookkeeping passes a context marking
+    /// it non-interactive, so it never reaches the Panel's Console tab even though MessageReceived
+    /// still fires for it same as any other response.
     /// </param>
     /// <exception cref="InvalidOperationException">The socket isn't currently connected.</exception>
     /// <exception cref="TimeoutException"><paramref name="timeout"/> elapsed with no response.</exception>
     public async Task<WebRconResponse> SendCommandAsync(
-        string command, TimeSpan? timeout = null, CancellationToken cancellationToken = default, bool raiseMessageReceived = true)
+        string command, TimeSpan? timeout = null, CancellationToken cancellationToken = default, object? userData = null)
     {
         var request = new WebRconRequest { Message = command, Identifier = _sequence.GetValue() };
         var completionSource = new TaskCompletionSource<WebRconResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -599,15 +608,14 @@ public class RustWebRconClient : IDisposable
             _pendingCommands[request.Identifier] = completionSource;
         }
 
-        if (!raiseMessageReceived)
+        // Registered before SendRequest goes out, not after awaiting it - the response can arrive (and
+        // OnMessageReceived can run) before this method's own call to SendRequest even returns, so
+        // there is no safe point after sending to register this. Registered unconditionally, even for
+        // userData: null - ConsumeUserData treats "registered with null" and "never registered at all"
+        // identically anyway, so there's no behavioral difference, just one less branch to get wrong.
+        lock (_userDataLock)
         {
-            // Registered before SendRequest goes out, not after awaiting it - the response can arrive
-            // (and OnMessageReceived can run) before this method's own call to SendRequest even
-            // returns, so there is no safe point after sending to register this.
-            lock (_quietRequestsLock)
-            {
-                _quietRequests.Add(request.Identifier);
-            }
+            _userData[request.Identifier] = userData;
         }
 
         try
@@ -630,22 +638,19 @@ public class RustWebRconClient : IDisposable
 
             // Normally already consumed by OnMessageReceived once the response arrives - this only
             // does anything if it never got that far (the send itself failed, or the wait above timed
-            // out/was cancelled first), so a quiet request's flag doesn't linger forever.
-            if (!raiseMessageReceived)
+            // out/was cancelled first), so a registration doesn't linger forever.
+            lock (_userDataLock)
             {
-                lock (_quietRequestsLock)
-                {
-                    _quietRequests.Remove(request.Identifier);
-                }
+                _userData.Remove(request.Identifier);
             }
         }
     }
     #endregion
 
     #region Private Methods
-    /// <param name="raiseMessageReceived">See <see cref="SendCommandAsync"/>'s remarks on the same
-    /// parameter - same meaning, just for this fire-and-forget/parser-dispatch path instead.</param>
-    private void SendCommand(string command, ParserBase parser, bool raiseMessageReceived = true)
+    /// <param name="userData">See <see cref="SendCommandAsync"/>'s remarks on the same parameter - same
+    /// meaning, just for this fire-and-forget/parser-dispatch path instead.</param>
+    private void SendCommand(string command, ParserBase parser, object? userData = null)
     {
         var request = new WebRconRequest { Message = command, Identifier = _sequence.GetValue() };
         lock (_outstandingRequestsLock)
@@ -653,14 +658,11 @@ public class RustWebRconClient : IDisposable
             _outstandingRequests.Add(request.Identifier, parser);
         }
 
-        if (!raiseMessageReceived)
+        // Same reasoning as SendCommandAsync's own registration - done before SendRequest, not after,
+        // since the response can arrive before this call even returns.
+        lock (_userDataLock)
         {
-            // Same reasoning as SendCommandAsync's own quiet registration - done before SendRequest,
-            // not after, since the response can arrive before this call even returns.
-            lock (_quietRequestsLock)
-            {
-                _quietRequests.Add(request.Identifier);
-            }
+            _userData[request.Identifier] = userData;
         }
 
         SendRequest(request);
@@ -695,8 +697,8 @@ public class RustWebRconClient : IDisposable
         // (e.g. RustArchon's own server console tail) - confirmed live: every reconnect was showing a
         // Carbon/Oxide version banner in the console purely as a side effect of this auto-detection,
         // not anything the server itself broadcast unprompted.
-        SendCommand("o.version", _parsers.First(p => p is OxideVersionParser), raiseMessageReceived: false);
-        SendCommand("c.version", _parsers.First(p => p is CarbonVersionParser), raiseMessageReceived: false);
+        SendCommand("o.version", _parsers.First(p => p is OxideVersionParser), RconCommandContext.Background);
+        SendCommand("c.version", _parsers.First(p => p is CarbonVersionParser), RconCommandContext.Background);
 
         return _modFrameworkDetection;
     }
