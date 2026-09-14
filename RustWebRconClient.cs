@@ -121,6 +121,18 @@ public class RustWebRconClient : IDisposable
     // race ahead of this registration) and consumed exactly once, in OnMessageReceived.
     private readonly object _quietRequestsLock = new();
     private readonly HashSet<int> _quietRequests = new();
+
+    // Backoff state for reconnect-after-error delays - see Socket_OnClose/Socket_OnOpen. Websocket.Client
+    // itself implements no backoff (a fixed ErrorReconnectTimeout retried indefinitely - confirmed by
+    // hand that the library reads this property fresh on every reconnect it schedules, not once at
+    // construction, which is what makes mutating it here work without fighting the library's internals
+    // or driving reconnection manually). Matches Websocket.Client's own default when neither constructor
+    // parameter overrides it.
+    private static readonly TimeSpan DefaultBackoffBase = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan DefaultMaxBackoff = TimeSpan.FromMinutes(5);
+    private readonly TimeSpan _baseErrorReconnectTimeout;
+    private readonly TimeSpan _maxErrorReconnectTimeout;
+    private TimeSpan _currentErrorReconnectTimeout;
     #endregion
 
     #region Constructor
@@ -134,10 +146,15 @@ public class RustWebRconClient : IDisposable
     /// Defaults to the library's own default (1 minute) when omitted.
     /// </param>
     /// <param name="errorReconnectTimeout">
-    /// The delay between reconnect attempts after a connection error. This is a fixed interval, not
-    /// exponential backoff - Websocket.Client doesn't implement backoff itself, and this class doesn't
-    /// layer one on top; it relies entirely on the library's own (indefinite) retry behavior. Defaults
-    /// to the library's own default (1 minute) when omitted.
+    /// The starting delay between reconnect attempts after a connection error - doubles on each
+    /// consecutive failure (see <see cref="Socket_OnClose"/>), up to <paramref name="maxErrorReconnectTimeout"/>,
+    /// and resets back to this value the moment a connection actually succeeds (see
+    /// <see cref="Socket_OnOpen"/>). Defaults to the library's own default (1 minute) when omitted.
+    /// </param>
+    /// <param name="maxErrorReconnectTimeout">
+    /// The cap the backoff above never exceeds. Defaults to 5 minutes - long enough that a real, ongoing
+    /// outage doesn't retry so fast it looks like abuse to whatever's on the other end, short enough
+    /// that a server coming back up is noticed within a reasonable time.
     /// </param>
     public RustWebRconClient(
         string name,
@@ -146,7 +163,8 @@ public class RustWebRconClient : IDisposable
         string password,
         int maxMessageLogSize = DefaultMaxMessageLogSize,
         TimeSpan? reconnectTimeout = null,
-        TimeSpan? errorReconnectTimeout = null)
+        TimeSpan? errorReconnectTimeout = null,
+        TimeSpan? maxErrorReconnectTimeout = null)
     {
         Name = name;
         Hostname = hostname;
@@ -164,6 +182,14 @@ public class RustWebRconClient : IDisposable
         {
             _socket.ErrorReconnectTimeout = errorReconnectTimeout;
         }
+
+        // The base/current backoff state - see Socket_OnClose/Socket_OnOpen. Read back whatever the
+        // socket actually ended up with (the value just set above, or the library's own default if
+        // errorReconnectTimeout was omitted) rather than duplicating "1 minute" as a second literal
+        // here that could drift out of sync with Websocket.Client's own default.
+        _baseErrorReconnectTimeout = _socket.ErrorReconnectTimeout ?? DefaultBackoffBase;
+        _currentErrorReconnectTimeout = _baseErrorReconnectTimeout;
+        _maxErrorReconnectTimeout = maxErrorReconnectTimeout ?? DefaultMaxBackoff;
 
         // Wrapped in SafeExecute, not called directly - see ProcessingError's remarks. This is the
         // one boundary between our code (including every subscriber's handler, invoked synchronously
@@ -266,11 +292,28 @@ public class RustWebRconClient : IDisposable
         }
 
         OnConnectionChanged(false, detail, disconnectionInfo.Exception);
+
+        // Doubled, capped at _maxErrorReconnectTimeout - every consecutive failure without a successful
+        // connection in between widens the gap before the next attempt. Confirmed live as a real,
+        // self-inflicted problem this was meant to fix: a fixed 10s retry hammering a real server
+        // through many hours of a debugging session is suspected of having tripped some rate/abuse
+        // detection on that server's host. Reset in Socket_OnOpen the moment a connection actually
+        // succeeds, so a brief blip doesn't leave this permanently elevated afterward.
+        var next = _currentErrorReconnectTimeout.Ticks * 2;
+        _currentErrorReconnectTimeout = next > _maxErrorReconnectTimeout.Ticks || next < 0
+            ? _maxErrorReconnectTimeout
+            : TimeSpan.FromTicks(next);
+        _socket.ErrorReconnectTimeout = _currentErrorReconnectTimeout;
     }
 
     private void Socket_OnOpen(ReconnectionInfo reconnectionInfo)
     {
         OnConnectionChanged(true, reconnectionInfo.Type.ToString());
+
+        // A real success - back to the base interval for whatever the next failure (if any) turns out
+        // to be, rather than staying elevated from a run of failures that's now over.
+        _currentErrorReconnectTimeout = _baseErrorReconnectTimeout;
+        _socket.ErrorReconnectTimeout = _baseErrorReconnectTimeout;
 
         // Determine the mod framework as soon as possible after connecting, rather than waiting for
         // a caller to ask - once known, this is a no-op (a reconnect doesn't change what's installed).
