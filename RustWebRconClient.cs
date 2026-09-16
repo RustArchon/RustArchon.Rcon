@@ -6,7 +6,6 @@ using RustArchon.Rcon.Parsers;
 using System.Net.WebSockets;
 using System.Text.Json;
 using Websocket.Client;
-using Websocket.Client.Models;
 
 namespace RustArchon.Rcon;
 
