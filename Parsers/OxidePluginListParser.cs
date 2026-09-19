@@ -1,6 +1,7 @@
 using RustArchon.Rcon.Containers;
 using RustArchon.Rcon.Entities;
 using RustArchon.Rcon.Messages;
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace RustArchon.Rcon.Parsers
@@ -23,7 +24,9 @@ namespace RustArchon.Rcon.Parsers
                 string name = match.Groups["name"].Value;
                 string version = match.Groups["version"].Value;
                 string author = match.Groups["author"].Value;
-                TimeSpan duration = TimeSpan.FromSeconds(Convert.ToDouble(match.Groups["duration"].Value));
+                // Invariant, not the current culture - the server's "0.03s" always uses a '.' regardless of
+                // what culture this process runs under.
+                TimeSpan duration = TimeSpan.FromSeconds(Convert.ToDouble(match.Groups["duration"].Value, CultureInfo.InvariantCulture));
                 string filename = match.Groups["filename"].Value;
                 OxidePlugin plugin = new OxidePlugin()
                 {
