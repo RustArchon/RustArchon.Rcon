@@ -71,8 +71,9 @@ public class CarbonPluginListParser : ParserBase
         for (int i = 1; i < lines.Length; i++)
         {
             string line = lines[i];
-            // actual plugin lines do not have a character in the first field
-            if (line[0] != ' ')
+            // actual plugin lines do not have a character in the first field. Empty lines (a trailing
+            // newline is enough to produce one) have no first character to look at at all.
+            if (line.Length == 0 || line[0] != ' ')
                 continue;
 
             if (line.Length == expectedLineLength)
