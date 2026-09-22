@@ -124,6 +124,16 @@ public class RustWebRconClient : IDisposable
     private readonly object _userDataLock = new();
     private readonly Dictionary<int, object?> _userData = new();
 
+    // The userData of commands that stopped waiting (timed out or were cancelled) after they had gone out. The server can still answer
+    // them, and a busy one does - a save can stall the console for longer than a caller's timeout - and that late answer must still be
+    // recognisable as the reply to what was asked, not as an unsolicited console line: the Worker files an unsolicited line as
+    // something a person typed and stores it, which is how empty background polls ended up in the Console tab. Guarded by
+    // _userDataLock; entries are consumed by their reply, dropped when they expire, and capped so a server that never answers cannot
+    // grow it without bound.
+    private static readonly long LateReplyWindowMs = (long)TimeSpan.FromMinutes(2).TotalMilliseconds;
+    private const int MaxLateReplyRegistrations = 256;
+    private readonly Dictionary<int, (object UserData, long ExpiresAtMs)> _lateReplyUserData = new();
+
     // Backoff state for reconnect-after-error delays - see Socket_OnClose/Socket_OnOpen. Websocket.Client
     // itself implements no backoff (a fixed ErrorReconnectTimeout retried indefinitely - confirmed by
     // hand that the library reads this property fresh on every reconnect it schedules, not once at
@@ -425,6 +435,12 @@ public class RustWebRconClient : IDisposable
                 return value;
             }
 
+            // A reply to a command that had already stopped waiting. Consumed like any other, and an expired one is as good as absent.
+            if (_lateReplyUserData.Remove(identifier, out var late) && late.ExpiresAtMs > Environment.TickCount64)
+            {
+                return late.UserData;
+            }
+
             return null;
         }
     }
@@ -617,12 +633,15 @@ public class RustWebRconClient : IDisposable
             _userData[request.Identifier] = userData;
         }
 
+        var sent = false;
         try
         {
             if (!SendRequest(request))
             {
                 throw new InvalidOperationException($"Cannot send a command to {Hostname}:{Port} - the socket isn't connected.");
             }
+
+            sent = true;
 
             return timeout.HasValue
                 ? await completionSource.Task.WaitAsync(timeout.Value, cancellationToken)
@@ -635,14 +654,42 @@ public class RustWebRconClient : IDisposable
                 _pendingCommands.Remove(request.Identifier);
             }
 
-            // Normally already consumed by OnMessageReceived once the response arrives - this only
-            // does anything if it never got that far (the send itself failed, or the wait above timed
-            // out/was cancelled first), so a registration doesn't linger forever.
+            // Normally already consumed by OnMessageReceived once the response arrives. If it was not, the registration must not
+            // linger forever - but what it does next depends on whether the request ever went out. If the send itself failed
+            // there is nothing to wait for and it is simply dropped; if the wait timed out or was cancelled, the server may
+            // still answer, so it is kept for a while (see _lateReplyUserData). This also covers the narrow race where the reply
+            // completes the wait and this block runs before OnMessageReceived has consumed the registration.
             lock (_userDataLock)
             {
-                _userData.Remove(request.Identifier);
+                if (_userData.Remove(request.Identifier, out var pendingUserData) && sent && pendingUserData is not null)
+                {
+                    KeepForLateReply(request.Identifier, pendingUserData);
+                }
             }
         }
+    }
+
+    // Caller holds _userDataLock.
+    private void KeepForLateReply(int identifier, object userData)
+    {
+        var now = Environment.TickCount64;
+
+        if (_lateReplyUserData.Count >= MaxLateReplyRegistrations)
+        {
+            foreach (var expired in _lateReplyUserData.Where(e => e.Value.ExpiresAtMs <= now).Select(e => e.Key).ToList())
+            {
+                _lateReplyUserData.Remove(expired);
+            }
+
+            // Still full of live ones: a server that answers nothing. Falling back to "unrecognised" for the newest is cheaper than
+            // growing without limit.
+            if (_lateReplyUserData.Count >= MaxLateReplyRegistrations)
+            {
+                return;
+            }
+        }
+
+        _lateReplyUserData[identifier] = (userData, now + LateReplyWindowMs);
     }
     #endregion
 
